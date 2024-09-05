@@ -1,0 +1,891 @@
+service: trigger-service
+
+frameworkVersion: "3"
+
+package:
+  exclude:
+    - './**'
+  include:
+    - 'src/**'
+
+provider:
+  tags:
+    LUMIGO_LOG_COLLECTION: "true"
+    lumigo:auto-trace: true
+    environment: ${env:ENV_NAME, self:provider.stage}
+    LUMIGO_TAG: ${self:service}
+  name: aws
+  deploymentBucket:
+    blockPublicAccess: true
+    serverSideEncryption: AES256
+  timeout: 30
+  stackName: trigger-service-${self:provider.stage}
+  stage: ${opt:stage, 'local'}
+  runtime: python3.11
+  region: us-east-1
+  apiGateway:
+    shouldStartNameWithService: true
+  eventBridge:
+    useCloudFormation: true
+  lambdaHashingVersion: 20201221
+  environment:
+    API_HOST: ${ssm:/${self:custom.env_name}/infra/api/host, 'api.local.jitdev.io'}
+    ENV_NAME: ${env:ENV_NAME, self:provider.stage}
+    DEPLOYMENT_STAGE: ${opt:stage,'local'}
+    testHost: http://localhost
+    SERVICE_NAME: ${self:service}
+    AWS_REGION_NAME: us-east-1
+    VENDOR_GITHUB: "github"
+    LAUNCH_DARKLY_SDK_KEY: ${ssm:/${self:custom.env_name}/infra/launch-darkly/sdk-key, true} # true is used for a Secure String SSM Parameter
+    DYNAMODB_ISOLATION_ROLE: ${ssm:/${self:custom.env_name}/infra/iam-role/dynamodb-assumed-iam-role, ''}
+    ENRICHMENT_STATE_MACHINE_ARN: arn:aws:states:#{AWS::Region}:#{AWS::AccountId}:stateMachine:${self:custom.env_name}-handle-enrichment-process
+    LOG_LEVEL: ${self:custom.logLevel.${self:provider.stage}, 'INFO'}
+    AWS_ACCOUNT_ID: "#{AWS::AccountId}"
+    RATE_LIMIT_THRESHOLD: ${ssm:/${self:custom.env_name}/infra/rate-limit/threshold, 100} # used in rate limit decorator
+    S3_EXECUTION_OUTPUTS_BUCKET_NAME: ${ssm:/${self:custom.env_name}/infra/s3/jit-execution-outputs/name, 'integration-tests-bucket'}
+  logs:
+    restApi:
+      level: ERROR
+      roleManagedExternally: true # Role was already created in terraform
+      accessLogging: false # Do not log only access to APIs
+      fullExecutionData: true # Log request/response data
+  iamRoleStatements:
+    # This IAM-role (used by the warmup lambda) must be a global role, because the warmup lambda is being created automatically
+    - Effect: Allow
+      Action:
+        - lambda:InvokeFunction
+      Resource:
+        - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-translate-to-jit-event
+        - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-handle-jit-event
+        - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-fetch-jit-event-resources
+        - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-run-jit-event-on-assets-by-ids
+        - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-enrich-async
+        - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-manual-execution
+        - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-get-jit-event
+
+plugins: ${self:custom.plugins.${self:provider.stage}, self:custom.plugins.default}
+
+custom:
+  env_name: ${env:ENV_NAME, self:provider.stage}
+  api_host: ${ssm:/${self:custom.env_name}/infra/api/host, 'api.local.jitdev.io'}
+  app_name:
+    prod: app-${self:provider.stage}
+    staging: app-${self:provider.stage}
+    dev: app-${self:provider.stage}
+    custom_env: app-${self:custom.env_name}-${self:provider.stage}
+  logLevel:
+  #    dev: DEBUG  # uncomment this line to enable DEBUG logging in dev
+  basePath: trigger
+  associateWaf:
+    name: jit-api-acl
+    version: V2
+  plugins:
+    local:
+      - serverless-localstack
+      - serverless-dotenv-plugin
+      - serverless-functions-base-path
+      - serverless-manifest-plugin
+      - serverless-plugin-ifelse
+      - serverless-prune-plugin
+      - serverless-pseudo-parameters
+      - serverless-python-requirements
+      - serverless-step-functions
+      - serverless-openapi-documenter
+    default:
+      - serverless-associate-waf
+      - serverless-domain-manager
+      - serverless-dotenv-plugin
+      - serverless-functions-base-path
+      - serverless-iam-roles-per-function
+      - serverless-manifest-plugin
+      - serverless-plugin-ifelse
+      - serverless-plugin-warmup
+      - serverless-prune-plugin
+      - serverless-pseudo-parameters
+      - serverless-python-requirements
+      - serverless-ssm-publish
+      - serverless-step-functions
+      - serverless-openapi-documenter
+  customDomain:
+    type: rest
+    domainName: ${self:custom.api_host}
+    basePath: ${self:custom.basePath}
+    certificateName: ${ssm:/${self:custom.env_name}/infra/api/host, 'api.local.jitdev.io'}
+    stage: ${self:provider.stage}
+    endpointType: 'edge'
+    securityPolicy: tls_1_2
+    createRoute53Record: true
+  documentation:
+    version: "1"
+    title: "Trigger Service"
+    description: "API to manage Executions"
+    termsOfService: https://www.jit.io/legal/terms
+    x-base-path: ${self:custom.basePath}
+    externalDocumentation:
+      url: https://docs.jit.io/docs
+      description: A link to the docs
+    tags:
+      - name: Executions
+        description: Executions management endpoints
+    servers:
+      url: https://${self:custom.api_host}/{basePath}
+      description: "The service API server"
+      variables:
+        basePath:
+          default: trigger
+    securitySchemes:
+      bearerAuth:
+        type: http
+        scheme: bearer
+        bearerFormat: JWT
+    security:
+      - bearerAuth: [ ]
+  localstack:
+    hostname:
+      local: http://localhost
+      test: ${self:provider.environment.testHost}
+      staging: remote
+    debug: true
+    stages:
+      - local
+      - test
+    host: ${self:custom.localstack.hostname.${self:provider.stage}, ''}
+    endpoints:
+      APIGateway: ${self:custom.localstack.host}:4566
+      S3: ${self:custom.localstack.host}:4566
+      DynamoDB: ${self:custom.localstack.host}:4566
+      CloudFormation: ${self:custom.localstack.host}:4566
+      Elasticsearch: ${self:custom.localstack.host}:4566
+      ES: ${self:custom.localstack.host}:4566
+      SNS: ${self:custom.localstack.host}:4566
+      SQS: ${self:custom.localstack.host}:4566
+      Lambda: ${self:custom.localstack.host}:4566
+  pythonRequirements:
+    dockerizePip: false
+  functionsBasePath: src/handlers
+  prune:
+    automatic: true
+    includeLayers: true
+    number: 3
+  dotenv:
+    path:
+      .env/.${self:provider.stage}
+  warmup:
+    workWeek:
+      enabled: false
+      events:
+        - schedule: cron(*/10 5-19 ? * SUN-FRI *)
+      concurrency: 3
+      prewarm: false
+      cleanFolder: false
+      role: IamRoleLambdaExecution
+      logRetentionInDays: 14
+      timeout: 30
+    weekEnd:
+      enabled: false
+      events:
+        - schedule: cron(*/30 5-13 ? * SAT *)
+      concurrency: 1
+      prewarm: false
+      cleanFolder: false
+      role: IamRoleLambdaExecution
+      logRetentionInDays: 14
+      timeout: 30
+  ssmPublish:
+    enabled: true
+    params:
+      - path: /${self:custom.env_name}/service-discovery/${self:service}
+        value: "https://${ssm:/${self:custom.env_name}/infra/api/host, 'api.local.jitdev.io'}/${self:custom.basePath}"
+        secure: false
+
+anchors:
+  jwtAuthorizer: &jwtAuthorizer
+    arn: ${ssm:/${self:custom.env_name}/infra/lambda/jwt-authorizer-v2, 'default'}
+    type: request
+    resultTtlInSeconds: 0 # if 0 caching is disabled / max value is 3600 for caching results
+  warmup: &warmup
+      workWeek:
+        enabled:
+          - staging
+          - prod
+      weekEnd:
+        enabled:
+          - staging
+          - prod
+  iamRoleStatements:
+    rateLimitPolicy: &rateLimitPolicy
+      Effect: Allow
+      Action:
+        - dynamodb:UpdateItem
+      Resource:
+        - arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/RateLimit
+    idempotencyPolicy: &idempotencyPolicy
+      # Ref: https://awslabs.github.io/aws-lambda-powertools-python/2.15.0/utilities/idempotency/#iam-permissions
+      Effect: Allow
+      Action:
+        - dynamodb:GetItem
+        - dynamodb:PutItem
+        - dynamodb:UpdateItem
+        - dynamodb:DeleteItem
+      Resource:
+        - arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/IdempotencyTable
+
+functions:
+  pr-jit-event-watchdog:
+    timeout: 60
+    memorySize: 512
+    handler: pr_jit_event_watchdog.handler
+    description: Watchdog for PR JIT events - determines that PR-related jit event has completed as expected
+    events:
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 0
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 1
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 2
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 3
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 4
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 5
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 6
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 7
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 8
+      - schedule:
+          rate: rate(2 minutes)
+          enabled: true
+          input:
+            gsi_bucket_index: 9
+    iamRoleStatementsName: trigger-service-pr-jit-event-watchdog-role
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+          - dynamodb:UpdateItem
+        Resource:
+          - arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle
+          - arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle/index/*
+      - Effect: Allow
+        Action: execute-api:Invoke
+        Resource:
+          # authentication-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/POST/token/internal
+          # github-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/app/*/installation/*/token
+      - Effect: Allow
+        Action:
+          - sqs:GetQueueUrl
+          - sqs:SendMessage
+        Resource:
+          - arn:aws:sqs:#{AWS::Region}:#{AWS::AccountId}:SendInternalNotificationQueue
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource: arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/jit-event-life-cycle
+
+  translate-to-jit-event:
+    timeout: 60
+    memorySize: 512
+    handler: translate_event.handler
+    description: Translates third party events to a Jit event with enriched data
+    events:
+      - eventBridge:
+          eventBus: ${ssm:/${self:custom.env_name}/infra/event-bus/webhook-dispatcher, 'default'}
+          pattern:
+            source:
+              - 'webhook-service'
+            detail-type:
+              - 'webhook-call'
+            detail:
+              vendor:
+                - ${self:provider.environment.VENDOR_GITHUB}
+              event_type:
+                - 'pull_request_opened'
+                - 'pull_request_synchronize'
+                - 'check_suite_rerequested'
+                - 'check_run_rerequested'
+      - eventBridge:
+          eventBus: ${ssm:/${self:custom.env_name}/infra/event-bus/webhook-dispatcher, 'default'}
+          pattern:
+            source:
+              - 'webhook-service'
+            detail-type:
+              - 'webhook-call'
+            detail:
+              vendor:
+                - ${self:provider.environment.VENDOR_GITHUB}
+              event_type:
+                - 'pull_request_closed'
+              webhook_body_json:
+                pull_request:
+                  merged:
+                    - true
+      - eventBridge:
+          eventBus: ${ssm:/${self:custom.env_name}/infra/event-bus/webhook-dispatcher, 'default'}
+          pattern:
+            source:
+              - webhook-service
+            detail-type:
+              - webhook-call
+            detail:
+              vendor:
+                - ${self:provider.environment.VENDOR_GITHUB}
+              event_type:
+                - deployment_status_created
+              webhook_body_json:
+                deployment_status:
+                  state:
+                    - success
+    warmup: *warmup
+    iamRoleStatementsName: trigger-service-translate-event-role
+    iamRoleStatements:
+      - *idempotencyPolicy
+      - Effect: Allow
+        Action: ssm:GetParameter
+        Resource: arn:aws:ssm:#{AWS::Region}:#{AWS::AccountId}:parameter/*/service-discovery/*-service
+      - Effect: Allow
+        Action: execute-api:Invoke
+        Resource:
+          # tenant-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/vendor/*/installation/*
+          # github-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/app/*/installation/*/owner/*/repo/*/pull/*/change-list
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/app/*/installation/*/owner/*/repo/*/languages
+          # asset-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/type/*/vendor/*/owner/*/name/*
+          # plan-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/controls
+          # authentication-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/POST/token/internal
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+        Resource:
+          - arn:aws:s3:::ovo-missing-assets-${self:custom.env_name}/*
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource: arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/trigger-execution
+
+  handle-jit-event:
+    timeout: 900
+    memorySize: 512
+    handler: handle_jit_event.handler
+    description: handles a jit event, going over the tenant's plan and deciding if to trigger events for execution
+    events:
+      - eventBridge:
+          eventBus: ${ssm:/${self:custom.env_name}/infra/event-bus/trigger-execution, 'default'}
+          pattern:
+            source:
+              - 'trigger-service'
+              - 'scheduling-service'
+              - 'action-service'
+              - 'asset-service'
+              - 'plan-service'
+              - 'finding-service'
+            detail-type:
+              - 'handle-jit-event'
+    warmup: *warmup
+    iamRoleStatementsName: trigger-service-handle-jit-event-role
+    iamRoleStatements:
+      - Effect: Allow
+        Action: ssm:GetParameter
+        Resource: arn:aws:ssm:#{AWS::Region}:#{AWS::AccountId}:parameter/*/service-discovery/*-service
+      - Effect: Allow
+        Action: execute-api:Invoke
+        Resource:
+          # tenant-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/vendor/*/installation/*
+          # github-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/app/*/installation/*/owner/*/repo/*/pull/*/change-list
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/app/*/installation/*/owner/*/repo/*/languages
+          # gitlab-service/github-service get-pr-change-list
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/internal/*/owners/*/repos/*/prs/*/change-list
+          # asset-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/type/*/vendor/*/owner/*/name/*
+          # plan-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/controls
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/centralized-repo-files-metadata/tenant-id/*
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/applications-configurations/trigger/*/tag/*
+          # authentication-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/POST/token/internal
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource:
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/trigger-execution
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/jit-event-life-cycle
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle
+      - Effect: Allow
+        Action:
+          - dynamodb:BatchGetItem
+          - dynamodb:PutItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/EnrichmentResults
+      - Effect: Allow
+        Action:
+          - states:StartExecution
+        Resource:
+          - ${self:provider.environment.ENRICHMENT_STATE_MACHINE_ARN}
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:PutObject
+        Resource:
+          - arn:aws:s3:::jit-large-messages-data-${self:custom.env_name}/* # sfn deferred messages decorator
+
+  fetch-jit-event-resources:
+    timeout: 60
+    memorySize: 512
+    handler: handle_jit_event.fetch_jit_event_resources_handler
+    description: Fetches all resources related to jit event, and sends event to fetch relevant assets for scan
+    events:
+      - eventBridge:
+          eventBus: ${ssm:/${self:custom.env_name}/infra/event-bus/trigger-execution, 'default'}
+          pattern:
+            source:
+              - 'gitlab-service' # code related jit event
+              - 'trigger-service' # manual execution / code related jit event
+              - 'action-service' # open fix pr
+              - 'finding-service' # open fix pr
+              - 'asset-service' # resource added
+            detail-type:
+              - 'handle-jit-event'
+    warmup: *warmup
+    iamRoleStatementsName: trigger-service-fetch-jit-event-resources-role
+    iamRoleStatements:
+      - Effect: Allow
+        Action: ssm:GetParameter
+        Resource: arn:aws:ssm:#{AWS::Region}:#{AWS::AccountId}:parameter/*/service-discovery/*-service
+      - Effect: Allow
+        Action: execute-api:Invoke
+        Resource:
+          # authentication-service get token
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/POST/token/internal
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource:
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/jit-event-life-cycle
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/trigger-execution
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle
+
+  run-jit-event-on-assets-by-ids:
+    timeout: 60
+    memorySize: 512
+    handler: handle_jit_event.run_jit_event_on_assets_by_ids_handler
+    description: Runs a jit event on assets by ids
+    events:
+      - eventBridge:
+          eventBus: ${ssm:/${self:custom.env_name}/infra/event-bus/trigger-execution, 'default'}
+          pattern:
+            source:
+              - 'trigger-service'
+            detail-type:
+              - 'run-jit-event-on-assets-by-ids'
+    warmup: *warmup
+    iamRoleStatementsName: trigger-service-run-jit-event-on-assets-by-ids-role
+    iamRoleStatements:
+      - Effect: Allow
+        Action: ssm:GetParameter
+        Resource: arn:aws:ssm:#{AWS::Region}:#{AWS::AccountId}:parameter/*/service-discovery/*-service
+      - Effect: Allow
+        Action: execute-api:Invoke
+        Resource:
+          # authentication-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/POST/token/internal
+          # gitlab-service/github-service get-pr-change-list
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/internal/*/owners/*/repos/*/prs/*/change-list
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource:
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/trigger-execution
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/jit-event-life-cycle
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle
+      - Effect: Allow
+        Action:
+          - dynamodb:BatchGetItem
+          - dynamodb:PutItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/EnrichmentResults
+      - Effect: Allow
+        Action:
+          - states:StartExecution
+        Resource:
+          - ${self:provider.environment.ENRICHMENT_STATE_MACHINE_ARN}
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:PutObject
+        Resource:
+          - arn:aws:s3:::jit-large-messages-data-${self:custom.env_name}/* # sfn deferred messages decorator
+
+  prepare-for-execution:
+    # Triggered from step functions
+    timeout: 60
+    memorySize: 512
+    handler: prepare_for_execution.handler
+    description: Received enriched event from handle-jit-event, find which jobs has to run and create the execution event
+    iamRoleStatementsName: trigger-service-prepare-for-execution-role
+    iamRoleStatements:
+      - Effect: Allow
+        Action: ssm:GetParameter
+        Resource: arn:aws:ssm:#{AWS::Region}:#{AWS::AccountId}:parameter/*/service-discovery/*-service
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource:
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/trigger-execution
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/jit-event-life-cycle
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/EnrichmentResults
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:PutObject
+        Resource:
+          - arn:aws:s3:::jit-large-messages-data-${self:custom.env_name}/* # sfn deferred messages decorator
+      - Effect: Allow
+        Action: execute-api:Invoke
+        Resource:
+          # plan-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/centralized-repo-files-metadata/tenant-id/*
+          # authentication-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/POST/token/internal
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle
+
+  enrich-async:
+    handler: enrich.enrich_async
+    description: Enriches an async event with the relevant data
+    warmup: *warmup
+    iamRoleStatementsName: trigger-service-enrich-async-role
+    iamRoleStatements:
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource:
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/trigger-execution
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:PutObject
+        Resource:
+          - arn:aws:s3:::jit-large-messages-data-${self:custom.env_name}/* # sfn deferred messages decorator
+      - Effect: Allow
+        Action: execute-api:Invoke
+        Resource:
+          # plan-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/GET/centralized-repo-files-metadata/tenant-id/*
+          # authentication-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/POST/token/internal
+
+  delete-tenant-data:
+    handler: delete_tenant_data.handler
+    memorySize: 512
+    timeout: 90
+    description: removes all tenant data from db
+    events:
+      - eventBridge:
+          eventBus: ${ssm:/${self:custom.env_name}/infra/event-bus/tenant-deletion, 'default'}
+          pattern:
+            source:
+              - 'tenant-service'
+              - 'backoffice-service'
+            detail-type:
+              - 'delete-tenant-data'
+    iamRoleStatementsName: trigger-service-delete-tenant-role
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:DeleteItem
+          - dynamodb:Query
+          - dynamodb:BatchWriteItem
+        Resource:
+          - arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle
+          - arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/EnrichmentResults
+
+  manual-execution:
+    handler: manual_execution.handler
+    events:
+      - http:
+          method: post
+          path: /event
+          authorizer: *jwtAuthorizer
+    warmup: *warmup
+    iamRoleStatementsName: trigger-service-manual-execution
+    iamRoleStatements:
+      - *rateLimitPolicy
+      - Effect: Allow
+        Action: execute-api:Invoke
+        Resource:
+          # authentication-service
+          - arn:aws:execute-api:#{AWS::Region}:#{AWS::AccountId}:*/${opt:stage}/POST/token/internal
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource: arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/trigger-execution
+
+  job-completed:
+    handler: job_completed.handler
+    memorySize: 512
+    description: Updates jit event life cycle that job has completed when execution finish or enrichment failed
+    events:
+      - eventBridge:
+          eventBus: ${ssm:/${self:custom.env_name}/infra/event-bus/executions, 'default'}
+          pattern:
+            source:
+              - execution-service
+            detail-type:
+              - execution-completed
+              - trigger-execution-failed
+            detail:
+              control_type:
+                - anything-but: enrichment
+              status:
+                - completed
+                - failed
+                - control_timeout
+                - watchdog_timeout
+                - canceled
+      - eventBridge:
+          eventBus: ${ssm:/${self:custom.env_name}/infra/event-bus/executions, 'default'}
+          pattern:
+            source:
+              - execution-service
+            detail-type:
+              - execution-completed
+              - trigger-execution-failed
+            detail:
+              control_type:
+                - enrichment
+              status:
+                - failed
+                - control_timeout
+                - watchdog_timeout
+                - canceled
+    iamRoleStatementsName: trigger-service-job-completed-role
+    iamRoleStatements:
+      - *idempotencyPolicy
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource:
+          - ${ssm:/${self:custom.env_name}/infra/event-bus/jit-event-life-cycle, 'default'}
+      - Effect: Allow
+        Action: dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle
+
+  get-jit-event:
+    handler: get_jit_event.handler
+    memorySize: 512
+    description: Get Jit Event Entity by id
+    events:
+    - http:
+        method: get
+        path: /events/{jit_event_id}
+        authorizer: *jwtAuthorizer
+    warmup: *warmup
+    iamRoleStatementsName: trigger-service-get-jit-event-role
+    iamRoleStatements:
+      - Effect: Allow
+        Action: dynamodb:GetItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle
+
+  step-function-failure:
+    handler: step_function_failure.handler
+    memorySize: 256
+    description: Reports on state machine failures
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - "aws.states"
+            detail-type:
+              - "Step Functions Execution Status Change"
+            detail:
+              status:
+                - "FAILED"
+                - "TIMED_OUT"
+                - "ABORTED"
+              stateMachineArn:
+                - ${self:provider.environment.ENRICHMENT_STATE_MACHINE_ARN}
+    iamRoleStatementsName: trigger-service-step-function-failure-role
+    iamRoleStatements:
+      - *idempotencyPolicy
+      - Effect: Allow
+        Action:
+          - sqs:GetQueueUrl
+          - sqs:SendMessage
+        Resource:
+          - arn:aws:sqs:#{AWS::Region}:#{AWS::AccountId}:SendInternalNotificationQueue
+      - Effect: Allow
+        Action: events:PutEvents
+        Resource:
+          - ${ssm:/${self:custom.env_name}/infra/event-bus/jit-event-life-cycle, 'default'}
+          - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/internal-failure
+      - Effect: Allow
+        Action: dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/JitEventLifeCycle
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:PutObject
+        Resource:
+          - arn:aws:s3:::jit-large-messages-data-${self:custom.env_name}/* # sfn deferred messages decorator
+
+stepFunctions:
+  stateMachines:
+    handle-enrichment-process:
+      name: ${self:custom.env_name}-handle-enrichment-process
+      definition: ${file(enrichment-process.asl.yaml)}
+      role:
+        Fn::GetAtt:
+          - StateMachineRole
+          - Arn
+
+
+resources:
+  Resources:
+    OvoMissingAssetsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ovo-missing-assets-${self:custom.env_name}
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        NotificationConfiguration:
+          EventBridgeConfiguration:
+            EventBridgeEnabled: true
+    StateMachineRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ProcessStateMachine
+        AssumeRolePolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - states.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Policies:
+          - PolicyName: ${self:custom.env_name}-handle-enrichment-process
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - events:PutEvents
+                  Resource:
+                    - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/trigger-execution
+                    - arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/internal-failure
+                - Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource:
+                    - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-enrich-async
+                    - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-prepare-for-execution
+                    - arn:aws:lambda:#{AWS::Region}:#{AWS::AccountId}:function:${self:service}-${opt:stage}-handle-enrichment-failed
+    JitEventLifeCycle:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: JitEventLifeCycle
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+          - AttributeName: GSI1PK_TENANT_ID
+            AttributeType: S
+          - AttributeName: GSI1SK_CREATED_AT
+            AttributeType: S
+          - AttributeName: GSI2PK_TTL_BUCKET
+            AttributeType: S
+          - AttributeName: GSI2SK_CREATED_AT
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: GSI1
+            KeySchema:
+              - AttributeName: GSI1PK_TENANT_ID
+                KeyType: HASH
+              - AttributeName: GSI1SK_CREATED_AT
+                KeyType: RANGE
+            Projection:
+              ProjectionType: 'ALL'
+          - IndexName: GSI2
+            KeySchema:
+              - AttributeName: GSI2PK_TTL_BUCKET
+                KeyType: HASH
+              - AttributeName: GSI2SK_CREATED_AT
+                KeyType: RANGE
+            Projection:
+              ProjectionType: 'ALL'
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+        BillingMode: PAY_PER_REQUEST
+    EnrichmentResults:  # Caches repository and pull request enrichment data (languages, frameworks) to optimize control execution
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: EnrichmentResults
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
